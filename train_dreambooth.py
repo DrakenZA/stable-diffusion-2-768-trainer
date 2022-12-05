@@ -17,19 +17,39 @@ from torch.utils.data import Dataset
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from diffusers import AutoencoderKL, DDIMScheduler, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDIMScheduler, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from huggingface_hub import HfFolder, Repository, whoami
 from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, PretrainedConfig
 
 
 torch.backends.cudnn.benchmark = True
 
 
 logger = get_logger(__name__)
+
+
+def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str):
+    text_encoder_config = PretrainedConfig.from_pretrained(
+        pretrained_model_name_or_path,
+        subfolder="text_encoder",
+        revision=args.revision,
+    )
+    model_class = text_encoder_config.architectures[0]
+
+    if model_class == "CLIPTextModel":
+        from transformers import CLIPTextModel
+
+        return CLIPTextModel
+    elif model_class == "RobertaSeriesModelWithTransformation":
+        from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
+
+        return RobertaSeriesModelWithTransformation
+    else:
+        raise ValueError(f"{model_class} is not supported.")
 
 
 def parse_args(input_args=None):
@@ -326,7 +346,7 @@ class DreamBoothDataset(Dataset):
         example["instance_images"] = self.image_transforms(instance_image)
         example["instance_prompt_ids"] = self.tokenizer(
             instance_prompt,
-            padding="max_length" if self.pad_tokens else "do_not_pad",
+            padding="do_not_pad",
             truncation=True,
             max_length=self.tokenizer.model_max_length,
         ).input_ids
@@ -339,7 +359,7 @@ class DreamBoothDataset(Dataset):
             example["class_images"] = self.image_transforms(class_image)
             example["class_prompt_ids"] = self.tokenizer(
                 class_prompt,
-                padding="max_length" if self.pad_tokens else "do_not_pad",
+                padding="do_not_pad",
                 truncation=True,
                 max_length=self.tokenizer.model_max_length,
             ).input_ids
@@ -445,7 +465,7 @@ def main(args):
             if cur_class_images < args.num_class_images:
                 torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
                 if pipeline is None:
-                    pipeline = StableDiffusionPipeline.from_pretrained(
+                    pipeline = DiffusionPipeline.from_pretrained(
                         args.pretrained_model_name_or_path,
                         vae=AutoencoderKL.from_pretrained(
                             args.pretrained_vae_name_or_path or args.pretrained_model_name_or_path,
@@ -485,19 +505,24 @@ def main(args):
 
     # Load the tokenizer
     if args.tokenizer_name:
-        tokenizer = CLIPTokenizer.from_pretrained(
+        tokenizer = AutoTokenizer.from_pretrained(
             args.tokenizer_name,
             revision=args.revision,
+            use_fast=False,
         )
     elif args.pretrained_model_name_or_path:
-        tokenizer = CLIPTokenizer.from_pretrained(
+        tokenizer = AutoTokenizer.from_pretrained(
             args.pretrained_model_name_or_path,
             subfolder="tokenizer",
             revision=args.revision,
+            use_fast=False,
         )
 
+    # import correct text encoder class
+    text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path)
+
     # Load models and create wrapper for stable diffusion
-    text_encoder = CLIPTextModel.from_pretrained(
+    text_encoder = text_encoder_cls.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="text_encoder",
         revision=args.revision,
@@ -580,7 +605,8 @@ def main(args):
 
         input_ids = tokenizer.pad(
             {"input_ids": input_ids},
-            padding=True,
+            padding="max_length" if args.pad_tokens else "do_not_pad",
+            max_length=tokenizer.model_max_length,
             return_tensors="pt",
         ).input_ids
 
@@ -681,9 +707,9 @@ def main(args):
             if args.train_text_encoder:
                 text_enc_model = accelerator.unwrap_model(text_encoder)
             else:
-                text_enc_model = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision)
+                text_enc_model = text_encoder_cls.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision)
             scheduler = DDIMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", clip_sample=False, set_alpha_to_one=False, prediction_type=noise_scheduler.config.prediction_type)
-            pipeline = StableDiffusionPipeline.from_pretrained(
+            pipeline = DiffusionPipeline.from_pretrained(
                 args.pretrained_model_name_or_path,
                 unet=accelerator.unwrap_model(unet),
                 text_encoder=text_enc_model,
@@ -794,16 +820,16 @@ def main(args):
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                 accelerator.backward(loss)
-                # if accelerator.sync_gradients:
-                #     params_to_clip = (
-                #         itertools.chain(unet.parameters(), text_encoder.parameters())
-                #         if args.train_text_encoder
-                #         else unet.parameters()
-                #     )
-                #     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                if accelerator.sync_gradients:
+                    params_to_clip = (
+                        itertools.chain(unet.parameters(), text_encoder.parameters())
+                        if args.train_text_encoder
+                        else unet.parameters()
+                    )
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad()
                 loss_avg.update(loss.detach_(), bsz)
 
             if not global_step % args.log_interval:
