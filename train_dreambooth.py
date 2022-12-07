@@ -605,7 +605,7 @@ def main(args):
 
         input_ids = tokenizer.pad(
             {"input_ids": input_ids},
-            padding="max_length" if args.pad_tokens else "do_not_pad",
+            padding=True,
             max_length=tokenizer.model_max_length,
             return_tensors="pt",
         ).input_ids
