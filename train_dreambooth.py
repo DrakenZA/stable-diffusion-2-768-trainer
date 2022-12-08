@@ -26,7 +26,6 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, PretrainedConfig
 
 
-torch.backends.cudnn.benchmark = True
 
 
 logger = get_logger(__name__)
@@ -536,7 +535,6 @@ def main(args):
         args.pretrained_model_name_or_path,
         subfolder="unet",
         revision=args.revision,
-        torch_dtype=torch.float32
     )
 
     vae.requires_grad_(False)
@@ -820,16 +818,16 @@ def main(args):
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                 accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    params_to_clip = (
-                        itertools.chain(unet.parameters(), text_encoder.parameters())
-                        if args.train_text_encoder
-                        else unet.parameters()
-                    )
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                # if accelerator.sync_gradients:
+                #     params_to_clip = (
+                #         itertools.chain(unet.parameters(), text_encoder.parameters())
+                #         if args.train_text_encoder
+                #         else unet.parameters()
+                #     )
+                #     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss_avg.update(loss.detach_(), bsz)
 
             if not global_step % args.log_interval:
